@@ -1,20 +1,22 @@
-import { airtableFetch, getEnv, jsonResponse, makeSessionId } from "./_airtable.js";
+import { airtableFetch, getEnv, makeSessionId, jsonResponse, optionsResponse } from "./_airtable.js";
 
-export async function POST(req) {
+export default async function handler(req, res) {
+  if (req.method === "OPTIONS") {
+    return optionsResponse();
+  }
+
+  if (req.method !== "POST") {
+    return jsonResponse(405, { error: "Method not allowed" });
+  }
+
   try {
     const { baseId, sessionsTable } = getEnv();
-    const body = await req.json().catch(() => null);
+    const body = req.body;
 
-    const device_id = body?.device_id;
-    const play_with = body?.play_with;
-    const alcohol = body?.alcohol;
-    const location = body?.location;
+    const { device_id, play_with, alcohol, location } = body;
 
     if (!device_id || !play_with || !alcohol || !location) {
-      return jsonResponse(400, {
-        status: "error",
-        error: "Missing required fields",
-      });
+      return jsonResponse(400, { error: "Missing required fields" });
     }
 
     const session_id = makeSessionId();
@@ -31,23 +33,17 @@ export async function POST(req) {
                 device_id,
                 play_with,
                 alcohol,
-                location,
-                level: "",
-                seen_ids: "[]",
-                status: "active",
-              },
-            },
-          ],
-        },
+                location
+              }
+            }
+          ]
+        }
       }
     );
 
-    if (!create.ok) {
-      return jsonResponse(500, { status: "error", error: "airtable_create_failed" });
-    }
+    return jsonResponse(200, { session_id });
 
-    return jsonResponse(200, { status: "ok", session_id });
-  } catch (e) {
-    return jsonResponse(500, { status: "error", error: "server_error" });
+  } catch (err) {
+    return jsonResponse(500, { error: err.message });
   }
 }
