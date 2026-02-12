@@ -32,14 +32,6 @@ export async function airtableFetch(path, { method = "GET", body } = {}) {
   }
   return { ok: true, status: res.status, json };
 }
-
-export function jsonResponse(status, data) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
 export function makeSessionId() {
   return `sess_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
@@ -52,4 +44,21 @@ export function safeParseJsonArray(s) {
   } catch {
     return [];
   }
+}
+export const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+export function jsonResponse(status, data) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...CORS_HEADERS,
+    },
+  });
+}
+export function optionsResponse() {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
 }
