@@ -1,198 +1,190 @@
-import {
-  airtableFetch,
-  getEnv,
-  jsonResponse,
-  optionsResponse,
-  safeParseJsonArray,
-} from "./_airtable.js";
+import { airtableFetch, getEnv, jsonResponse, optionsResponse, safeParseJsonArray } from "./_airtable.js";
 
-/**
- * CORS preflight
- */
 export async function OPTIONS() {
   return optionsResponse();
 }
 
-/**
- * POST /api/challenge-next
- * body: { session_id: "sess_..." }
- */
+// kleine Helfer, damit nichts 300 Sekunden hängt
+function withTimeout(promise, ms, label = "timeout") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+  ]);
+}
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
 export default async function handler(req, res) {
-  // CORS preflight
-  if (req.method === "OPTIONS") {
-    return optionsResponse();
-  }
-
-  // Only allow POST
-  if (req.method !== "POST") {
-    return jsonResponse(405, { status: "error", error: "Method not allowed" });
-  }
-
   try {
-    const { baseId, sessionsTable, challengesTable } = getEnv();
+    // CORS preflight
+    if (req.method === "OPTIONS") return optionsResponse();
+
+    // Nur POST erlauben
+    if (req.method !== "POST") {
+      return jsonResponse(405, { status: "error", error: "Method not allowed" });
+    }
+
+    const env = getEnv();
+    const baseId = env.baseId;
+    const sessionsTable = env.sessionsTable || env.sessions_table || process.env.AIRTABLE_SESSIONS_TABLE;
+    const challengesTable = env.challengesTable || env.challenges_table || process.env.AIRTABLE_CHALLENGES_TABLE;
+
+    if (!baseId || !sessionsTable || !challengesTable) {
+      return jsonResponse(500, {
+        status: "error",
+        error: "missing_env",
+        detail: { baseId: !!baseId, sessionsTable: !!sessionsTable, challengesTable: !!challengesTable },
+      });
+    }
 
     const body = req.body || {};
     const session_id = body.session_id;
 
     if (!session_id) {
-      return jsonResponse(400, {
-        status: "error",
-        error: "missing_required_fields",
-        detail: { required: ["session_id"] },
-      });
+      return jsonResponse(400, { status: "error", error: "Missing session_id" });
     }
 
-    // ---- 1) Load session by session_id ----
-    const sessionQuery = `/` +
-      `${encodeURIComponent(baseId)}/${encodeURIComponent(sessionsTable)}` +
-      `?pageSize=1&filterByFormula=${encodeURIComponent(`{session_id}="${session_id}"`)}`;
+    // 1) Session laden
+    const sessionParams = new URLSearchParams({
+      maxRecords: "1",
+      filterByFormula: `{session_id}='${String(session_id).replaceAll("'", "\\'")}'`,
+    });
 
-    const sessionRes = await airtableFetch(sessionQuery, { method: "GET" });
+    const sessionResp = await withTimeout(
+      airtableFetch(`/${baseId}/${encodeURIComponent(sessionsTable)}?${sessionParams.toString()}`, "GET"),
+      12000,
+      "airtable_session_fetch_timeout"
+    );
 
-    if (!sessionRes.ok) {
+    if (!sessionResp?.ok) {
       return jsonResponse(422, {
         status: "error",
-        error: "airtable_session_lookup_failed",
-        detail: sessionRes.json,
+        error: "airtable_session_fetch_failed",
+        detail: sessionResp?.json || null,
       });
     }
 
-    const sessionRecords = sessionRes.json?.records || [];
-    if (sessionRecords.length === 0) {
-      return jsonResponse(404, {
-        status: "error",
-        error: "session_not_found",
-        detail: { session_id },
-      });
+    const sessionRecord = (sessionResp.json?.records || [])[0];
+    if (!sessionRecord) {
+      return jsonResponse(404, { status: "error", error: "session_not_found" });
     }
 
-    const sessionRecord = sessionRecords[0];
-    const sessionFields = sessionRecord.fields || {};
+    const sf = sessionRecord.fields || {};
 
-    // ---- 2) Derive filters for challenges ----
-    // Expected values in Airtable (based on your screenshot):
-    // group_type: family | friends | partner | colleagues
-    // mode: alcohol | non-alcohol
-    // difficulty: yamas | heatwave | crashout
-    // status: active
-    // language: deutsch
+    // Session-Felder (aus deiner Sessions-Base)
+    const group_type = sf.group_type || sf.play_with; // fallback falls du das in Sessions anders benannt hast
+    const mode = sf.mode || sf.alcohol;
+    const difficulty = sf.difficulty || sf.level;
+    const language = sf.language || "deutsch";
 
-    const group_type = String(sessionFields.play_with || "").toLowerCase().trim();
-    const alcoholVal = String(sessionFields.alcohol || "").toLowerCase();
-    const mode =
-      alcoholVal.includes("free") || alcoholVal.includes("non") ? "non-alcohol" : "alcohol";
+    // seen_ids robust lesen (kann Array sein oder JSON-String)
+    let seen_ids = sf.seen_ids;
+    if (typeof seen_ids === "string") seen_ids = safeParseJsonArray(seen_ids);
+    if (!Array.isArray(seen_ids)) seen_ids = [];
 
-    const difficulty = String(sessionFields.level || "").toLowerCase().trim();
-    const language = String(sessionFields.language || "deutsch").toLowerCase().trim();
-
-    // seen_ids can be stored as JSON string in a text field
-    const seen_ids = safeParseJsonArray(sessionFields.seen_ids);
-
-    // Basic validation so we don't query nonsense
-    if (!group_type || !mode || !difficulty || !language) {
+    if (!group_type || !mode || !difficulty) {
       return jsonResponse(422, {
         status: "error",
-        error: "session_missing_filters",
-        detail: {
-          play_with: sessionFields.play_with,
-          alcohol: sessionFields.alcohol,
-          level: sessionFields.level,
-          language: sessionFields.language,
-        },
+        error: "session_fields_missing",
+        detail: { group_type, mode, difficulty, language },
       });
     }
 
-    // ---- 3) Fetch matching challenges from Airtable ----
-    // We filter by the main fields in Airtable, and do the "not seen" filter in code.
-    const filterFormula = `AND(
-      {status}="active",
-      {group_type}="${group_type}",
-      {mode}="${mode}",
-      {difficulty}="${difficulty}",
-      {language}="${language}"
-    )`;
+    // 2) Challenges holen (nur passende Filter, Rest filtern wir in JS)
+    const challengeParams = new URLSearchParams({
+      maxRecords: "200",
+      filterByFormula:
+        `AND(` +
+        `{status}='active',` +
+        `{group_type}='${String(group_type).replaceAll("'", "\\'")}',` +
+        `{mode}='${String(mode).replaceAll("'", "\\'")}',` +
+        `{difficulty}='${String(difficulty).replaceAll("'", "\\'")}',` +
+        `{language}='${String(language).replaceAll("'", "\\'")}'` +
+        `)`,
+    });
 
-    const challengesQuery =
-      `/${encodeURIComponent(baseId)}/${encodeURIComponent(challengesTable)}` +
-      `?pageSize=100&filterByFormula=${encodeURIComponent(filterFormula)}`;
+    const challResp = await withTimeout(
+      airtableFetch(`/${baseId}/${encodeURIComponent(challengesTable)}?${challengeParams.toString()}`, "GET"),
+      12000,
+      "airtable_challenges_fetch_timeout"
+    );
 
-    const challengesRes = await airtableFetch(challengesQuery, { method: "GET" });
-
-    if (!challengesRes.ok) {
+    if (!challResp?.ok) {
       return jsonResponse(422, {
         status: "error",
         error: "airtable_challenges_fetch_failed",
-        detail: challengesRes.json,
+        detail: challResp?.json || null,
       });
     }
 
-    const allChallenges = challengesRes.json?.records || [];
+    const all = challResp.json?.records || [];
 
-    // Filter out already seen challenges by challenge_id (numeric in your table)
-    const unseen = allChallenges.filter((r) => {
+    // 3) Auswählen (ohne Endlosschleife)
+    const unseen = all.filter(r => {
       const cid = r?.fields?.challenge_id;
-      if (cid === undefined || cid === null) return false;
-      return !seen_ids.includes(String(cid));
+      return cid != null && !seen_ids.includes(cid);
     });
 
-    if (unseen.length === 0) {
-      return jsonResponse(200, {
-        status: "ok",
-        done: true,
-        message: "no_more_unseen_challenges_for_this_filter_set",
-        filters: { group_type, mode, difficulty, language },
-        seen_ids,
-      });
+    let chosen = null;
+
+    if (unseen.length > 0) {
+      chosen = pickRandom(unseen);
+    } else if (all.length > 0) {
+      // Alles “gesehen” -> wir resetten sinnvollerweise die seen_ids
+      chosen = pickRandom(all);
+      seen_ids = [];
+    } else {
+      return jsonResponse(404, { status: "error", error: "no_matching_challenges" });
     }
 
-    // Pick a random unseen challenge
-    const picked = unseen[Math.floor(Math.random() * unseen.length)];
-    const pickedFields = picked.fields || {};
+    const chosenFields = chosen.fields || {};
+    const chosenId = chosenFields.challenge_id;
 
-    const pickedChallengeId = String(pickedFields.challenge_id);
-    const nextSeen = [...seen_ids, pickedChallengeId];
+    // 4) Session updaten: seen_ids +1
+    const newSeen = [...seen_ids, chosenId];
 
-    // ---- 4) Update session.seen_ids in Airtable ----
-    // Store as JSON string in a text field (safe for Airtable)
-    const updateRes = await airtableFetch(
-      `/${encodeURIComponent(baseId)}/${encodeURIComponent(sessionsTable)}/${encodeURIComponent(sessionRecord.id)}`,
-      {
-        method: "PATCH",
-        body: {
-          fields: {
-            seen_ids: JSON.stringify(nextSeen),
+    const updateResp = await withTimeout(
+      airtableFetch(`/${baseId}/${encodeURIComponent(sessionsTable)}`, "PATCH", {
+        records: [
+          {
+            id: sessionRecord.id,
+            fields: {
+              seen_ids: JSON.stringify(newSeen),
+            },
           },
-        },
-      }
+        ],
+      }),
+      12000,
+      "airtable_session_update_timeout"
     );
 
-    if (!updateRes.ok) {
+    if (!updateResp?.ok) {
       return jsonResponse(422, {
         status: "error",
         error: "airtable_session_update_failed",
-        detail: updateRes.json,
+        detail: updateResp?.json || null,
       });
     }
 
-    // ---- 5) Return challenge ----
+    // 5) Antwort
     return jsonResponse(200, {
       status: "ok",
       challenge: {
-        challenge_id: pickedFields.challenge_id,
-        challenge_text: pickedFields.challenge_text,
-        group_type: pickedFields.group_type,
-        mode: pickedFields.mode,
-        difficulty: pickedFields.difficulty,
-        language: pickedFields.language,
+        challenge_id: chosenFields.challenge_id,
+        challenge_text: chosenFields.challenge_text,
+        group_type: chosenFields.group_type,
+        mode: chosenFields.mode,
+        difficulty: chosenFields.difficulty,
+        language: chosenFields.language,
       },
-      session_id,
-      seen_ids: nextSeen,
+      meta: {
+        used_session: { group_type, mode, difficulty, language },
+        counts: { total: all.length, unseen: unseen.length },
+      },
     });
   } catch (e) {
-    return jsonResponse(500, {
-      status: "error",
-      error: "server_error",
-      detail: String(e?.message || e),
-    });
+    return jsonResponse(500, { status: "error", error: "server_error", detail: String(e?.message || e) });
   }
 }
