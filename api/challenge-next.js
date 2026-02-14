@@ -14,38 +14,42 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { baseId, challengesTable } = getEnv();
-    const { session_id } = req.body || {};
+    console.log("STEP 1: Request received");
 
-    if (!session_id) {
+    const { baseId, challengesTable } = getEnv();
+    console.log("STEP 2: ENV loaded", baseId, challengesTable);
+
+    const body = req.body;
+    console.log("STEP 3: Body", body);
+
+    if (!body.session_id) {
       return jsonResponse(400, { error: "Missing session_id" });
     }
 
-    // 🔹 1. Lade ALLE aktiven Challenges (limitiert!)
+    console.log("STEP 4: Fetching Airtable...");
+
     const response = await airtableFetch(
-      `/${baseId}/${encodeURIComponent(challengesTable)}?filterByFormula={status}='active'&maxRecords=50`
+      `/${baseId}/${encodeURIComponent(challengesTable)}?maxRecords=1`
     );
 
-    const challenges = response.records || [];
+    console.log("STEP 5: Airtable response received");
 
-    if (challenges.length === 0) {
-      return jsonResponse(404, { error: "No active challenges found" });
+    const data = await response.json();
+    console.log("STEP 6: Parsed JSON", data);
+
+    if (!data.records || data.records.length === 0) {
+      return jsonResponse(404, { error: "No challenges found" });
     }
 
-    // 🔹 2. Wähle zufällige Challenge
-    const randomIndex = Math.floor(Math.random() * challenges.length);
-    const challenge = challenges[randomIndex];
+    const record = data.records[0];
 
     return jsonResponse(200, {
-      challenge_id: challenge.fields.challenge_id,
-      challenge_text: challenge.fields.challenge_text,
-      group_type: challenge.fields.group_type,
-      mode: challenge.fields.mode,
-      difficulty: challenge.fields.difficulty
+      challenge_id: record.id,
+      challenge_text: record.fields.challenge_text
     });
 
   } catch (error) {
-    console.error("challenge-next error:", error);
-    return jsonResponse(500, { error: "Internal server error" });
+    console.error("ERROR:", error);
+    return jsonResponse(500, { error: "Internal error", detail: error.message });
   }
 }
