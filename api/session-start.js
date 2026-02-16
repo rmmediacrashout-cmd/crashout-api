@@ -1,73 +1,65 @@
+// api/session-start.js
+
 import {
   airtableFetch,
   getEnv,
-  makeSessionId,
   jsonResponse,
+  makeSessionId,
   optionsResponse,
 } from "./_airtable.js";
 
-export async function OPTIONS() {
-  return optionsResponse();
-}
-
 export default async function handler(req, res) {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "POST") {
-    return jsonResponse(405, { error: "Method not allowed" });
-  }
+  if (req.method === "OPTIONS") return optionsResponse(res);
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
 
   try {
     const { baseId, sessionsTable } = getEnv();
     const body = req.body || {};
 
-    const { device_id, play_with, alcohol, location, level } = body;
+    const device_id = body.device_id;
+    const play_with = body.play_with;
+    const alcohol = body.alcohol;
+    const location = body.location;
 
     if (!device_id || !play_with || !alcohol || !location) {
-      return jsonResponse(400, { error: "Missing required fields" });
+      return jsonResponse(res, 400, {
+        error: "Missing required fields",
+        required: ["device_id", "play_with", "alcohol", "location"],
+        got: Object.keys(body),
+      });
     }
 
     const session_id = makeSessionId();
+
+    // IMPORTANT: seen_ids ist Long text -> wir speichern JSON string
+    const fields = {
+      session_id,
+      device_id,
+      play_with,
+      alcohol,
+      location,
+      seen_ids: "[]",
+    };
 
     const create = await airtableFetch(
       `/${baseId}/${encodeURIComponent(sessionsTable)}`,
       {
         method: "POST",
-        body: {
-          records: [
-            {
-              fields: {
-                session_id,
-                device_id,
-                play_with,
-                alcohol,
-                location,
-                // level ist optional – falls leer/undefined: einfach nicht setzen
-                ...(level ? { level } : {}),
-                // Long text: wir speichern JSON-String!
-                seen_ids: "[]",
-                status: "active",
-              },
-            },
-          ],
-        },
+        body: { records: [{ fields }] },
       }
     );
 
-    const rec = create?.records?.[0];
-    if (!rec?.fields?.session_id) {
-      return jsonResponse(422, {
+    if (!create.ok) {
+      return jsonResponse(res, 422, {
         status: "error",
         error: "airtable_create_failed",
-        detail: create,
+        detail: create.data,
       });
     }
 
-    return jsonResponse(200, {
-      status: "ok",
-      session_id: rec.fields.session_id,
-    });
-  } catch (err) {
-    console.error("session-start error:", err);
-    return jsonResponse(500, { error: "Internal server error" });
+    return jsonResponse(res, 200, { status: "ok", session_id });
+  } catch (e) {
+    console.error("session-start error:", e);
+    return jsonResponse(res, 500, { error: "Internal server error" });
   }
 }
