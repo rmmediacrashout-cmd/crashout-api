@@ -1,68 +1,56 @@
-// api/_airtable.js
+// api/_airtable.js  (Next.js pages/api style: handler(req,res))
 
-// ==============================
-// ENV
-// ==============================
 export function getEnv() {
   const airtablePat = process.env.AIRTABLE_PAT;
   const baseId = process.env.AIRTABLE_BASE_ID;
   const sessionsTable = process.env.AIRTABLE_SESSIONS_TABLE;
   const challengesTable = process.env.AIRTABLE_CHALLENGES_TABLE;
 
-  if (!airtablePat || !baseId) {
-    throw new Error("Missing Airtable environment variables");
-  }
+  if (!airtablePat) throw new Error("Missing AIRTABLE_PAT");
+  if (!baseId) throw new Error("Missing AIRTABLE_BASE_ID");
+  if (!sessionsTable) throw new Error("Missing AIRTABLE_SESSIONS_TABLE");
+  if (!challengesTable) throw new Error("Missing AIRTABLE_CHALLENGES_TABLE");
 
-  return {
-    airtablePat,
-    baseId,
-    sessionsTable,
-    challengesTable,
-  };
+  return { airtablePat, baseId, sessionsTable, challengesTable };
 }
 
-// ==============================
-// JSON RESPONSE HELPER
-// ==============================
-export function jsonResponse(status, data) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    },
-  });
+export function optionsResponse(res) {
+  res.status(204);
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.end();
 }
 
-// ==============================
-// OPTIONS RESPONSE (CORS)
-// ==============================
-export function optionsResponse() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    },
-  });
+export function jsonResponse(res, status, data) {
+  res.status(status);
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.end(JSON.stringify(data));
 }
 
-// ==============================
-// AIRTABLE FETCH (MIT TIMEOUT!)
-// ==============================
+export function makeSessionId() {
+  return `sess_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+export function escapeFormulaString(value) {
+  // Airtable formula strings use double quotes.
+  // We escape backslashes and quotes.
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 export async function airtableFetch(path, opts = {}) {
   const { airtablePat } = getEnv();
-
   const url = `https://api.airtable.com/v0${path}`;
+
   const controller = new AbortController();
-  const timeoutMs = 15000; // 15 Sekunden
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutMs = 15000;
+  const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(url, {
+    const r = await fetch(url, {
       method: opts.method || "GET",
       headers: {
         Authorization: `Bearer ${airtablePat}`,
@@ -73,37 +61,23 @@ export async function airtableFetch(path, opts = {}) {
       signal: controller.signal,
     });
 
-    const text = await res.text();
-
-    let data;
+    const text = await r.text();
+    let json = null;
     try {
-      data = JSON.parse(text);
+      json = JSON.parse(text);
     } catch {
-      data = { raw: text };
+      json = { raw: text };
     }
 
-    if (!res.ok) {
-      return {
-        airtable_error: true,
-        status: res.status,
-        data,
-      };
-    }
-
-    return data;
-  } catch (error) {
-    const isTimeout = error?.name === "AbortError";
-
+    return { ok: r.ok, status: r.status, data: json };
+  } catch (e) {
+    const isTimeout = e?.name === "AbortError";
     return {
-      airtable_error: true,
+      ok: false,
       status: isTimeout ? 504 : 500,
-      data: {
-        message: isTimeout
-          ? `Airtable timeout after ${timeoutMs}ms`
-          : String(error),
-      },
+      data: { error: isTimeout ? `timeout_${timeoutMs}ms` : String(e) },
     };
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(t);
   }
 }
