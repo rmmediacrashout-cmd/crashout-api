@@ -1,111 +1,125 @@
-import { airtableFetch, getEnv, jsonResponse, optionsResponse } from "./_airtable.js";
+// api/challenge-next.js
 
-export async function OPTIONS() {
-  return optionsResponse();
+import { airtableFetch, getEnv, jsonResponse, optionsResponse, readJsonBody } from "./_airtable.js";
+
+function escapeAirtableValue(v) {
+  // Airtable Formulas: Strings müssen "..." sein und Quotes doppeln
+  return String(v).replace(/"/g, '\\"');
+}
+
+function parseSeenIds(seenText) {
+  if (!seenText) return [];
+  if (Array.isArray(seenText)) return seenText; // falls Airtable mal anders liefert
+  try {
+    const arr = JSON.parse(seenText);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return jsonResponse(res, 405, { error: "Method not allowed" });
-  }
-
   try {
+    if (req.method === "OPTIONS") return optionsResponse(res);
+    if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+
+    const body = await readJsonBody(req);
+    if (!body) return jsonResponse(res, 400, { error: "Invalid JSON body" });
+
+    const { session_id } = body;
+    if (!session_id) return jsonResponse(res, 400, { error: "Missing session_id" });
+
     const { baseId, challengesTable, sessionsTable } = getEnv();
-    const { session_id } = req.body || {};
 
-    if (!session_id) {
-      return jsonResponse(res, 400, { error: "missing_session_id" });
-    }
-
-    // 1️⃣ Session laden
-    const sessionResp = await airtableFetch(
-      `${baseId}/${encodeURIComponent(sessionsTable)}?filterByFormula={session_id}="${session_id}"`
+    // 1) Session laden (damit wir Filterwerte + seen_ids haben)
+    const sessResp = await airtableFetch(
+      `/${baseId}/${encodeURIComponent(sessionsTable)}?filterByFormula=${encodeURIComponent(
+        `{session_id}="${escapeAirtableValue(session_id)}"`
+      )}&maxRecords=1`
     );
 
-    const sessionRecord = sessionResp?.records?.[0];
-
-    if (!sessionRecord) {
+    const sessRecord = sessResp.data?.records?.[0];
+    if (!sessResp.ok || !sessRecord) {
       return jsonResponse(res, 404, { error: "session_not_found" });
     }
 
-    const sessionFields = sessionRecord.fields || {};
+    const sessFields = sessRecord.fields || {};
+    const seenIds = parseSeenIds(sessFields.seen_ids);
 
-    // 2️⃣ seen_ids robust parsen
-    let seenIds = [];
-    try {
-      if (sessionFields.seen_ids) {
-        seenIds = JSON.parse(sessionFields.seen_ids);
-        if (!Array.isArray(seenIds)) seenIds = [];
-      }
-    } catch (e) {
-      seenIds = [];
+    // 2) Filter aus Session bauen (nur Felder, die existieren/gefüllt sind)
+    // Achtung: Feldnamen hier müssen zu deinen Challenge-Feldnamen passen!
+    // In deiner Console war z.B. filter: { group_type:'friends', mode:'non-alcohol' }
+    const parts = [`{status}="active"`];
+
+    if (sessFields.play_with) parts.push(`{group_type}="${escapeAirtableValue(sessFields.play_with)}"`);
+    if (sessFields.alcohol) parts.push(`{mode}="${escapeAirtableValue(sessFields.alcohol)}"`);
+    if (sessFields.location) parts.push(`{location}="${escapeAirtableValue(sessFields.location)}"`);
+    if (sessFields.level) parts.push(`{level}="${escapeAirtableValue(sessFields.level)}"`);
+
+    const filterFormula = `AND(${parts.join(",")})`;
+
+    // 3) Challenges laden
+    const challResp = await airtableFetch(
+      `/${baseId}/${encodeURIComponent(challengesTable)}?filterByFormula=${encodeURIComponent(filterFormula)}&maxRecords=100`
+    );
+
+    if (!challResp.ok) {
+      return jsonResponse(res, 500, { error: "airtable_challenges_fetch_failed", detail: challResp.data || challResp.raw });
     }
 
-    // 3️⃣ Filter aufbauen
-    const filterFormula = `
-      AND(
-        {status}="active",
-        {group_type}="${sessionFields.play_with}",
-        {mode}="${sessionFields.alcohol}",
-        {location}="${sessionFields.location}",
-        {level}="${sessionFields.level}"
-      )
-    `.replace(/\n/g, "");
-
-    const challengesResp = await airtableFetch(
-      `${baseId}/${encodeURIComponent(challengesTable)}?filterByFormula=${encodeURIComponent(filterFormula)}`
-    );
-
-    const allChallenges = challengesResp?.records || [];
-
-    // 4️⃣ Bereits gesehene rausfiltern
-    const availableChallenges = allChallenges.filter(c =>
-      !seenIds.includes(c.id)
-    );
-
-    if (availableChallenges.length === 0) {
+    const challenges = challResp.data?.records || [];
+    if (challenges.length === 0) {
       return jsonResponse(res, 404, {
         error: "no_matching_challenges_found",
+        filter: { formula: filterFormula },
       });
     }
 
-    // 5️⃣ Zufällige wählen
-    const randomIndex = Math.floor(Math.random() * availableChallenges.length);
-    const challenge = availableChallenges[randomIndex];
-
-    // 6️⃣ Neue ID zu seen_ids hinzufügen
-    const updatedSeenIds = [...seenIds, challenge.id];
-
-    await airtableFetch(
-      `${baseId}/${encodeURIComponent(sessionsTable)}`,
-      {
-        method: "PATCH",
-        body: JSON.stringify({
-          records: [
-            {
-              id: sessionRecord.id,
-              fields: {
-                seen_ids: JSON.stringify(updatedSeenIds),
-              },
-            },
-          ],
-        }),
-      }
-    );
-
-    return jsonResponse(res, 200, {
-      status: "ok",
-      challenge: {
-        id: challenge.id,
-        ...challenge.fields,
-      },
+    // 4) “ungesehene” Challenges priorisieren
+    const unseen = challenges.filter((r) => {
+      const cid = r.fields?.challenge_id;
+      return cid && !seenIds.includes(cid);
     });
 
+    const pool = unseen.length ? unseen : challenges;
+    const picked = pool[Math.floor(Math.random() * pool.length)];
+    const pickedId = picked.fields?.challenge_id;
+
+    // 5) seen_ids updaten (nur wenn challenge_id existiert)
+    if (pickedId) {
+      const newSeen = unseen.length ? [...seenIds, pickedId] : [pickedId]; // wenn alles gesehen -> reset auf [picked]
+      const updateResp = await airtableFetch(
+        `/${baseId}/${encodeURIComponent(sessionsTable)}/${encodeURIComponent(sessRecord.id)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ fields: { seen_ids: JSON.stringify(newSeen) } }),
+        }
+      );
+
+      if (!updateResp.ok) {
+        // Challenge trotzdem zurückgeben, aber Update-Problem sichtbar machen
+        return jsonResponse(res, 200, {
+          status: "ok",
+          warning: "seen_ids_update_failed",
+          challenge: picked.fields || {},
+          filter: { formula: filterFormula },
+          seen_ids_before: seenIds,
+          detail: updateResp.data || updateResp.raw,
+        });
+      }
+    }
+
+    // 6) Response
+    return jsonResponse(res, 200, {
+      status: "ok",
+      challenge: picked.fields || {},
+      filter: { formula: filterFormula },
+    });
   } catch (err) {
-    console.error("challenge-next error:", err);
     return jsonResponse(res, 500, {
+      status: "error",
       error: "internal_server_error",
-      message: err?.message || "unknown_error",
+      message: err?.message || String(err),
     });
   }
 }
