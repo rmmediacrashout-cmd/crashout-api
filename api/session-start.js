@@ -1,52 +1,38 @@
-// /api/session-start.js
-import { airtableFetch, getEnv, jsonResponse, optionsResponse } from "./_airtable.js";
+// api/session-start.js
 
-export async function OPTIONS(req, res) {
-  return optionsResponse(res);
+import { airtableFetch, getEnv, jsonResponse, optionsResponse, readJsonBody } from "./_airtable.js";
+
+function makeSessionId() {
+  // stabil genug für MVP
+  return `sess_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
 }
 
 export default async function handler(req, res) {
   try {
     if (req.method === "OPTIONS") return optionsResponse(res);
+    if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
 
-    if (req.method !== "POST") {
-      return jsonResponse(res, 405, { error: "Method not allowed" });
-    }
+    const body = await readJsonBody(req);
+    if (!body) return jsonResponse(res, 400, { error: "Invalid JSON body" });
 
-    const baseId = getEnv("AIRTABLE_BASE_ID");
-    const sessionsTable = getEnv("AIRTABLE_SESSIONS_TABLE"); // z.B. "Sessions"
+    const { baseId, sessionsTable } = getEnv();
 
-    // Next.js liefert req.body je nach Setup als object oder string
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const device_id = body.device_id ?? null;
+    const play_with = body.play_with ?? null;   // Single select value (string)
+    const alcohol = body.alcohol ?? null;       // Single select value (string)
+    const location = body.location ?? null;     // Single select value (string)
+    const level = body.level ?? null;           // Single select value (string)
 
-    const {
-      device_id,
-      play_with,
-      alcohol,
-      location,
-      level,
-    } = body;
+    const session_id = makeSessionId();
 
-    if (!device_id || !play_with || !alcohol || !location) {
-      return jsonResponse(res, 400, {
-        status: "error",
-        error: "missing_required_fields",
-        required: ["device_id", "play_with", "alcohol", "location"],
-        got: body,
-      });
-    }
-
-    // Session-ID erzeugen
-    const session_id = `sess_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
-
-    // seen_ids als JSON-String, weil Airtable long-text ist
     const fields = {
       session_id,
       device_id,
       play_with,
       alcohol,
       location,
-      ...(level ? { level } : {}),
+      level,
+      // Long-text Feld -> als JSON-Array-String speichern
       seen_ids: "[]",
       status: "active",
     };
@@ -59,17 +45,15 @@ export default async function handler(req, res) {
       }
     );
 
-    // Airtable wirklich fehlgeschlagen -> 422 zurückgeben
     if (!createResp.ok) {
       return jsonResponse(res, 422, {
         status: "error",
         error: "airtable_create_failed",
-        detail: createResp,
-        sent_fields: fields,
+        detail: createResp.data || createResp.raw,
       });
     }
 
-    const record = createResp.data?.records?.[0];
+    const record = createResp.data?.records?.[0] || null;
 
     return jsonResponse(res, 200, {
       status: "ok",
@@ -78,11 +62,10 @@ export default async function handler(req, res) {
       fields: record?.fields || fields,
     });
   } catch (err) {
-    console.error("session-start error:", err);
     return jsonResponse(res, 500, {
       status: "error",
       error: "internal_server_error",
-      message: String(err?.message || err),
+      message: err?.message || String(err),
     });
   }
 }
