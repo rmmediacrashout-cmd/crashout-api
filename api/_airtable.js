@@ -1,43 +1,53 @@
-// api/_airtable.js
-
 export function optionsResponse(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  return res.status(200).end();
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.statusCode = 200;
+  res.end();
 }
 
-export function jsonResponse(res, statusCode, data) {
+export function jsonResponse(res, status, data) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Content-Type", "application/json");
-  return res.status(statusCode).json(data);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.statusCode = status;
+  res.end(JSON.stringify(data));
+}
+
+// Robust: funktioniert sowohl wenn req.body bereits existiert,
+// als auch wenn wir den Stream selbst lesen müssen.
+export async function readJsonBody(req) {
+  if (req.body && typeof req.body === "object") return req.body;
+
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return { __raw: raw, __parse_error: true };
+  }
 }
 
 export function getEnv() {
-  const AIRTABLE_PAT = process.env.AIRTABLE_PAT;
-  const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
-  const AIRTABLE_SESSIONS_TABLE = process.env.AIRTABLE_SESSIONS_TABLE;
-  const AIRTABLE_CHALLENGES_TABLE = process.env.AIRTABLE_CHALLENGES_TABLE;
+  // Wir akzeptieren beide Namen, damit du nicht wieder an Vercel drehen musst.
+  const pat =
+    process.env.AIRTABLE_PAT ||
+    process.env.AIRTABLE_TOKEN ||
+    process.env.AIRTABLE_API_KEY;
 
-  // absichtlich klare Fehlermeldungen
-  if (!AIRTABLE_PAT) throw new Error("Missing env var: AIRTABLE_PAT");
-  if (!AIRTABLE_BASE_ID) throw new Error("Missing env var: AIRTABLE_BASE_ID");
-  if (!AIRTABLE_SESSIONS_TABLE) throw new Error("Missing env var: AIRTABLE_SESSIONS_TABLE");
-  if (!AIRTABLE_CHALLENGES_TABLE) throw new Error("Missing env var: AIRTABLE_CHALLENGES_TABLE");
+  const baseId = process.env.AIRTABLE_BASE_ID;
+  const challengesTable =
+    process.env.AIRTABLE_CHALLENGES_TABLE || "Challenges";
+  const sessionsTable = process.env.AIRTABLE_SESSIONS_TABLE || "Sessions";
 
-  return {
-    pat: AIRTABLE_PAT,
-    baseId: AIRTABLE_BASE_ID,
-    sessionsTable: AIRTABLE_SESSIONS_TABLE,
-    challengesTable: AIRTABLE_CHALLENGES_TABLE,
-  };
+  if (!pat) throw new Error("Missing env var: AIRTABLE_PAT");
+  if (!baseId) throw new Error("Missing env var: AIRTABLE_BASE_ID");
+
+  return { pat, baseId, challengesTable, sessionsTable };
 }
 
-/**
- * airtableFetch:
- * - gibt IMMER ein Objekt zurück: { ok, status, data, raw }
- * - raw ist der geparste JSON Body (oder Text), gut fürs Debugging
- */
 export async function airtableFetch(path, options = {}) {
   const { pat } = getEnv();
 
@@ -50,18 +60,18 @@ export async function airtableFetch(path, options = {}) {
 
   const r = await fetch(url, { ...options, headers });
 
-  let raw;
-  const ct = r.headers.get("content-type") || "";
-  if (ct.includes("application/json")) {
-    raw = await r.json().catch(() => null);
-  } else {
-    raw = await r.text().catch(() => null);
+  const text = await r.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (e) {
+    data = { __raw: text };
   }
 
   return {
     ok: r.ok,
     status: r.status,
-    data: raw,
-    raw,
+    data,
+    raw: text,
   };
 }
