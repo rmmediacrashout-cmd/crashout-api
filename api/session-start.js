@@ -1,5 +1,11 @@
 // api/session-start.js
-import { airtableFetch, getEnvVars, jsonResponse, optionsResponse, readJsonBody } from "./_airtable.js";
+import {
+  airtableFetch,
+  getEnvVars,
+  jsonResponse,
+  optionsResponse,
+  readJsonBody,
+} from "./_airtable.js";
 
 export async function OPTIONS(req, res) {
   return optionsResponse(res);
@@ -8,22 +14,24 @@ export async function OPTIONS(req, res) {
 export default async function handler(req, res) {
   try {
     if (req.method === "OPTIONS") return optionsResponse(res);
-    if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+    if (req.method !== "POST")
+      return jsonResponse(res, 405, { error: "Method not allowed" });
 
     const { baseId, sessionsTable } = getEnvVars();
     const body = await readJsonBody(req);
 
     const device_id = body.device_id ?? null;
-    const play_with = body.play_with ?? null;  // Single select text
-    const alcohol = body.alcohol ?? null;      // Single select text
-    const location = body.location ?? null;    // Single select text
-    const level = body.level ?? null;          // Single select text
+    const play_with = body.play_with ?? null; // Single select text
+    const alcohol = body.alcohol ?? null; // Single select text
+    const location = body.location ?? null; // Single select text
+    const level = body.level ?? null; // Single select text
 
     if (!device_id) {
       return jsonResponse(res, 400, { status: "error", error: "missing_device_id" });
     }
 
     // ✅ long-text => JSON Array als STRING speichern
+    // ❗ created_at / updated_at NICHT senden (Airtable computed fields)
     const fields = {
       session_id: `sess_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`,
       device_id,
@@ -31,19 +39,14 @@ export default async function handler(req, res) {
       alcohol,
       location,
       level,
-      seen_ids: "[]",     // <<< wichtig
+      seen_ids: "[]", // <<< wichtig: long-text bleibt STRING
       status: "active",
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
     };
 
-    const createResp = await airtableFetch(
-      `/${baseId}/${encodeURIComponent(sessionsTable)}`,
-      {
-        method: "POST",
-        body: JSON.stringify({ records: [{ fields }] }),
-      }
-    );
+    const createResp = await airtableFetch(`/${baseId}/${encodeURIComponent(sessionsTable)}`, {
+      method: "POST",
+      body: JSON.stringify({ records: [{ fields }] }),
+    });
 
     if (!createResp.ok) {
       return jsonResponse(res, 422, {
