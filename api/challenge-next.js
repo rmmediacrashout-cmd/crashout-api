@@ -1,165 +1,153 @@
-import { airtableFetch, getEnv, jsonResponse, optionsResponse } from "./_airtable.js";
+// api/challenge-next.js
+import { airtableFetch, getEnvVars, jsonResponse, optionsResponse, readJsonBody } from "./_airtable.js";
 
-export async function OPTIONS() {
-  return optionsResponse();
+export async function OPTIONS(req, res) {
+  return optionsResponse(res);
+}
+
+function safeParseSeenIds(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v; // falls Airtable mal was komisches liefert
+  if (typeof v !== "string") return [];
+  try {
+    const parsed = JSON.parse(v);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 export default async function handler(req, res) {
-  // CORS Preflight
-  if (req.method === "OPTIONS") return optionsResponse(res);
-
-  // Nur POST erlauben
-  if (req.method !== "POST") {
-    return jsonResponse(res, 405, { error: "Method not allowed" });
-  }
-
   try {
-    const { baseId, challengesTable, sessionsTable } = getEnv();
+    if (req.method === "OPTIONS") return optionsResponse(res);
+    if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
 
-    const { session_id } = req.body || {};
+    const { baseId, challengesTable, sessionsTable } = getEnvVars();
+    const body = await readJsonBody(req);
+    const session_id = body.session_id;
+
     if (!session_id) {
-      return jsonResponse(res, 400, { error: "Missing session_id" });
+      return jsonResponse(res, 400, { status: "error", error: "missing_session_id" });
     }
 
-    // 1) Session in Airtable finden (über session_id Feld)
-    const sessionLookup = await airtableFetch(
-      `/${baseId}/${encodeURIComponent(sessionsTable)}?filterByFormula=${encodeURIComponent(
-        `{session_id}="${session_id}"`
-      )}&maxRecords=1`
+    // 1) Session laden
+    const sessResp = await airtableFetch(
+      `/${baseId}/${encodeURIComponent(sessionsTable)}?filterByFormula=${encodeURIComponent(`{session_id}='${session_id}'`)}&maxRecords=1`,
+      { method: "GET" }
     );
 
-    if (!sessionLookup.ok) {
+    if (!sessResp.ok) {
       return jsonResponse(res, 500, {
-        error: "airtable_sessions_fetch_failed",
-        detail: sessionLookup,
+        status: "error",
+        error: "airtable_session_fetch_failed",
+        detail: sessResp.data || sessResp.text,
       });
     }
 
-    const sessionRecord = sessionLookup.data?.records?.[0];
+    const sessionRecord = sessResp.data?.records?.[0];
     if (!sessionRecord) {
-      return jsonResponse(res, 404, { error: "session_not_found" });
+      return jsonResponse(res, 404, { status: "error", error: "session_not_found" });
     }
 
-    const sessionFields = sessionRecord.fields || {};
-    const seenRaw = sessionFields.seen_ids;
+    const s = sessionRecord.fields || {};
+    const seen = safeParseSeenIds(s.seen_ids);
 
-    // 2) seen_ids robust parsen (Long text)
-    let seenIds = [];
-    if (typeof seenRaw === "string" && seenRaw.trim().length > 0) {
-      try {
-        const parsed = JSON.parse(seenRaw);
-        if (Array.isArray(parsed)) seenIds = parsed;
-      } catch (e) {
-        // Fallback: alle "rec...." IDs aus dem Text ziehen
-        const matches = seenRaw.match(/rec[a-zA-Z0-9]+/g);
-        if (matches) seenIds = matches;
-      }
-    }
+    // 2) Challenge-Filter aus Session bauen
+    // Airtable-Felder: group_type, mode, difficulty, status (active)
+    const filters = [];
+    filters.push(`{status}='active'`);
 
-    // Duplikate entfernen
-    seenIds = Array.from(new Set(seenIds));
+    if (s.play_with) filters.push(`{group_type}='${s.play_with}'`);
+    if (s.alcohol) filters.push(`{mode}='${s.alcohol}'`);
+    if (s.level) filters.push(`{difficulty}='${s.level}'`);
 
-    // 3) Filter (aus Session-Feldern) für Challenges bauen
-    //    Wichtig: diese Werte müssen exakt so heißen wie in Airtable (Single Select)
-    const groupType = sessionFields.play_with || sessionFields.group_type || null;
-    const mode = sessionFields.alcohol || sessionFields.mode || null;
-    const difficulty = sessionFields.level || sessionFields.difficulty || null;
+    const formula = `AND(${filters.join(",")})`;
 
-    // Airtable FilterByFormula
-    const formulaParts = [`{status}="active"`];
-    if (groupType) formulaParts.push(`{group_type}="${groupType}"`);
-    if (mode) formulaParts.push(`{mode}="${mode}"`);
-    if (difficulty) formulaParts.push(`{difficulty}="${difficulty}"`);
-
-    const filterFormula = `AND(${formulaParts.join(",")})`;
-
-    // 4) Challenges laden (limitiert; reicht für MVP)
-    const challengesResp = await airtableFetch(
-      `/${baseId}/${encodeURIComponent(challengesTable)}?filterByFormula=${encodeURIComponent(
-        filterFormula
-      )}&maxRecords=100`
+    const chResp = await airtableFetch(
+      `/${baseId}/${encodeURIComponent(challengesTable)}?filterByFormula=${encodeURIComponent(formula)}&maxRecords=100`,
+      { method: "GET" }
     );
 
-    if (!challengesResp.ok) {
+    if (!chResp.ok) {
       return jsonResponse(res, 500, {
+        status: "error",
         error: "airtable_challenges_fetch_failed",
-        detail: challengesResp,
+        detail: chResp.data || chResp.text,
+        formula,
       });
     }
 
-    const challenges = challengesResp.data?.records || [];
+    const challenges = chResp.data?.records || [];
     if (challenges.length === 0) {
       return jsonResponse(res, 404, {
+        status: "error",
         error: "no_matching_challenges_found",
-        filter: { group_type: groupType, mode, difficulty },
+        filter: { group_type: s.play_with, mode: s.alcohol, difficulty: s.level },
+        formula,
       });
     }
 
-    // 5) Bereits gesehene rausfiltern
-    const unseen = challenges.filter((c) => !seenIds.includes(c.id));
+    // 3) Ungesehene herausfiltern
+    const unseen = challenges.filter(r => {
+      const cid = r.fields?.challenge_id;
+      return cid != null && !seen.includes(cid);
+    });
 
-    // Wenn alles gesehen wurde: optional reset (für MVP sinnvoll)
-    // -> dann darf wieder von vorne gestartet werden
-    const pool = unseen.length > 0 ? unseen : challenges;
+    const pickFrom = unseen.length ? unseen : challenges; // wenn alle gesehen -> wiederholen erlaubt
+    const random = pickFrom[Math.floor(Math.random() * pickFrom.length)];
 
-    // 6) Random auswählen
-    const pick = pool[Math.floor(Math.random() * pool.length)];
+    const challenge = {
+      id: random.id,
+      challenge_id: random.fields?.challenge_id,
+      challenge_text: random.fields?.challenge_text,
+      group_type: random.fields?.group_type,
+      mode: random.fields?.mode,
+      difficulty: random.fields?.difficulty,
+      status: random.fields?.status,
+    };
 
-    // 7) seen_ids updaten (append), aber nur wenn es nicht schon drin ist
-    if (!seenIds.includes(pick.id)) seenIds.push(pick.id);
+    // 4) seen_ids updaten (nur wenn challenge_id vorhanden)
+    if (challenge.challenge_id != null) {
+      const updatedSeen = seen.includes(challenge.challenge_id) ? seen : [...seen, challenge.challenge_id];
 
-    const updateResp = await airtableFetch(
-      `/${baseId}/${encodeURIComponent(sessionsTable)}/${pickSafeId(sessionRecord.id)}`,
-      {
-        method: "PATCH",
-        body: JSON.stringify({
-          fields: {
-            seen_ids: JSON.stringify(seenIds),
-          },
-        }),
+      const updResp = await airtableFetch(
+        `/${baseId}/${encodeURIComponent(sessionsTable)}/${sessionRecord.id}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            fields: {
+              seen_ids: JSON.stringify(updatedSeen),
+              updated_at: new Date().toISOString(),
+            },
+          }),
+        }
+      );
+
+      if (!updResp.ok) {
+        // Challenge trotzdem zurückgeben, aber warnen
+        return jsonResponse(res, 200, {
+          status: "ok",
+          session_id,
+          challenge,
+          warning: "seen_ids_update_failed",
+          seen_ids_before: seen,
+          detail: updResp.data || updResp.text,
+        });
       }
-    );
-
-    if (!updateResp.ok) {
-      // Wir geben trotzdem die Challenge zurück, aber melden Update-Fehler
-      return jsonResponse(res, 200, {
-        status: "ok",
-        session_id,
-        warning: "seen_ids_update_failed",
-        challenge: mapChallenge(pick),
-        filter: { group_type: groupType, mode, difficulty },
-        detail: updateResp,
-      });
     }
 
-    // 8) Antwort
     return jsonResponse(res, 200, {
       status: "ok",
       session_id,
-      challenge: mapChallenge(pick),
-      filter: { group_type: groupType, mode, difficulty },
-      seen_ids: seenIds, // hilfreich fürs Debugging
+      challenge,
+      filter: { group_type: s.play_with, mode: s.alcohol, difficulty: s.level },
     });
   } catch (err) {
     console.error("challenge-next error:", err);
-    return jsonResponse(res, 500, { error: "internal_server_error" });
+    return jsonResponse(res, 500, {
+      status: "error",
+      error: "internal_server_error",
+      message: String(err?.message || err),
+    });
   }
-}
-
-// Airtable record IDs sind safe, aber wir kapseln es sauber
-function pickSafeId(id) {
-  return encodeURIComponent(id);
-}
-
-function mapChallenge(record) {
-  const f = record.fields || {};
-  return {
-    id: record.id, // Airtable Record ID (wichtig für seen_ids)
-    challenge_id: f.challenge_id,
-    challenge_text: f.challenge_text,
-    group_type: f.group_type,
-    mode: f.mode,
-    difficulty: f.difficulty,
-    status: f.status,
-  };
 }
