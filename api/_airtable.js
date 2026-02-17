@@ -1,77 +1,88 @@
+// api/_airtable.js
+
+function getEnv(name, fallbackNames = []) {
+  const v = process.env[name];
+  if (v) return v;
+  for (const fb of fallbackNames) {
+    const vv = process.env[fb];
+    if (vv) return vv;
+  }
+  return null;
+}
+
+// ✅ Nutze AIRTABLE_PAT (wie bei dir in Vercel), aber erlaube Fallbacks
+const AIRTABLE_TOKEN = getEnv("AIRTABLE_PAT", ["AIRTABLE_TOKEN", "AIRTABLE_API_KEY"]);
+const AIRTABLE_BASE_ID = getEnv("AIRTABLE_BASE_ID");
+const AIRTABLE_CHALLENGES_TABLE = getEnv("AIRTABLE_CHALLENGES_TABLE");
+const AIRTABLE_SESSIONS_TABLE = getEnv("AIRTABLE_SESSIONS_TABLE");
+
 export function optionsResponse(res) {
+  // Wichtig für Browser-Calls (CORS)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.statusCode = 200;
-  res.end();
+  res.status(200).json({ ok: true });
 }
 
 export function jsonResponse(res, status, data) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.statusCode = status;
-  res.end(JSON.stringify(data));
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  return res.status(status).json(data);
 }
 
-// Robust: funktioniert sowohl wenn req.body bereits existiert,
-// als auch wenn wir den Stream selbst lesen müssen.
 export async function readJsonBody(req) {
-  if (req.body && typeof req.body === "object") return req.body;
-
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString("utf8").trim();
-
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    return { __raw: raw, __parse_error: true };
+  // Vercel Node/Next API route: req.body ist manchmal schon geparst, manchmal string
+  if (req.body == null) return {};
+  if (typeof req.body === "object") return req.body;
+  if (typeof req.body === "string") {
+    try {
+      return JSON.parse(req.body);
+    } catch {
+      return {};
+    }
   }
+  return {};
 }
 
-export function getEnv() {
-  // Wir akzeptieren beide Namen, damit du nicht wieder an Vercel drehen musst.
-  const pat =
-    process.env.AIRTABLE_PAT ||
-    process.env.AIRTABLE_TOKEN ||
-    process.env.AIRTABLE_API_KEY;
+export function getEnvVars() {
+  if (!AIRTABLE_TOKEN) throw new Error("Missing env var: AIRTABLE_PAT");
+  if (!AIRTABLE_BASE_ID) throw new Error("Missing env var: AIRTABLE_BASE_ID");
+  if (!AIRTABLE_CHALLENGES_TABLE) throw new Error("Missing env var: AIRTABLE_CHALLENGES_TABLE");
+  if (!AIRTABLE_SESSIONS_TABLE) throw new Error("Missing env var: AIRTABLE_SESSIONS_TABLE");
 
-  const baseId = process.env.AIRTABLE_BASE_ID;
-  const challengesTable =
-    process.env.AIRTABLE_CHALLENGES_TABLE || "Challenges";
-  const sessionsTable = process.env.AIRTABLE_SESSIONS_TABLE || "Sessions";
-
-  if (!pat) throw new Error("Missing env var: AIRTABLE_PAT");
-  if (!baseId) throw new Error("Missing env var: AIRTABLE_BASE_ID");
-
-  return { pat, baseId, challengesTable, sessionsTable };
+  return {
+    token: AIRTABLE_TOKEN,
+    baseId: AIRTABLE_BASE_ID,
+    challengesTable: AIRTABLE_CHALLENGES_TABLE,
+    sessionsTable: AIRTABLE_SESSIONS_TABLE,
+  };
 }
 
-export async function airtableFetch(path, options = {}) {
-  const { pat } = getEnv();
+export async function airtableFetch(path, init = {}) {
+  const { token } = getEnvVars();
 
   const url = `https://api.airtable.com/v0${path}`;
   const headers = {
-    Authorization: `Bearer ${pat}`,
+    Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
-    ...(options.headers || {}),
+    ...(init.headers || {}),
   };
 
-  const r = await fetch(url, { ...options, headers });
+  const r = await fetch(url, { ...init, headers });
 
   const text = await r.text();
   let data = null;
   try {
     data = text ? JSON.parse(text) : null;
-  } catch (e) {
-    data = { __raw: text };
+  } catch {
+    data = null;
   }
 
   return {
     ok: r.ok,
     status: r.status,
+    text,
     data,
-    raw: text,
   };
 }
