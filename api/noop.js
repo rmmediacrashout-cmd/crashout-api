@@ -1,10 +1,6 @@
-export default function handler(req, res) {
-  const { play_with, alcohol, location, level } = req.body;
+export async function POST(request) {
+  const body = await request.json();
+  const { play_with, alcohol, location, level } = body;
 
-  res.status(200).json({
-    play_with,
-    alcohol,
-    location,
-    level
-  });
+  return Response.json({ play_with, alcohol, location, level });
 }
