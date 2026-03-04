@@ -1,5 +1,11 @@
 // api/challenge-next.js
-import { airtableFetch, getEnvVars, jsonResponse, optionsResponse, readJsonBody } from "./_airtable.js";
+import {
+  airtableFetch,
+  getEnvVars,
+  jsonResponse,
+  optionsResponse,
+  readJsonBody,
+} from "./_airtable.js";
 
 export async function OPTIONS(req, res) {
   return optionsResponse(res);
@@ -8,158 +14,146 @@ export async function OPTIONS(req, res) {
 export default async function handler(req, res) {
   try {
     if (req.method === "OPTIONS") return optionsResponse(res);
-    if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+    if (req.method !== "POST") {
+      return jsonResponse(res, 405, { error: "Method not allowed" });
+    }
 
-    const { baseId, challengesTable, sessionsTable } = getEnvVars();
+    const { baseId, sessionsTable, challengesTable } = getEnvVars();
+
     const body = await readJsonBody(req);
+    const session_id = (body.session_id || "").trim();
 
-    const { session_id } = body || {};
     if (!session_id) {
       return jsonResponse(res, 400, { status: "error", error: "missing_session_id" });
     }
 
-    // 1) Session laden
+    // 1) Session holen
+    const sessionFormula = `{session_id}='${session_id}'`;
     const sessResp = await airtableFetch(
-      `/${baseId}/${encodeURIComponent(sessionsTable)}?filterByFormula=${encodeURIComponent(
-        `{session_id}='${session_id}'`
-      )}&maxRecords=1`,
-      { method: "GET" }
+      `/v0/${baseId}/${encodeURIComponent(sessionsTable)}?filterByFormula=${encodeURIComponent(
+        sessionFormula
+      )}&maxRecords=1`
     );
 
     if (!sessResp.ok) {
-      return jsonResponse(res, 500, {
+      return jsonResponse(res, 502, {
         status: "error",
-        error: "airtable_sessions_fetch_failed",
-        detail: sessResp.data || sessResp.text,
+        error: "airtable_session_fetch_failed",
+        airtable_status: sessResp.status,
+        airtable_error: sessResp.data ?? null,
+        session_id,
       });
     }
 
-    const sessionRecord = sessResp.data?.records?.[0];
-    if (!sessionRecord) {
-      return jsonResponse(res, 404, { status: "error", error: "session_not_found" });
+    const srec = sessResp.data?.records?.[0];
+    if (!srec) {
+      return jsonResponse(res, 404, { status: "error", error: "session_not_found", session_id });
     }
 
-    const s = sessionRecord.fields || {};
+    const s = srec.fields || {};
+
     const group_type = s.play_with || null;
     const mode = s.alcohol || null;
     const difficulty = s.level || null;
 
-    // seen_ids: long-text JSON array string => robust parsen
-    let seen = [];
-    try {
-      if (typeof s.seen_ids === "string" && s.seen_ids.trim() !== "") {
-        const parsed = JSON.parse(s.seen_ids);
-        if (Array.isArray(parsed)) seen = parsed;
-      } else if (Array.isArray(s.seen_ids)) {
-        // falls es doch mal als Array ankommt
-        seen = s.seen_ids;
-      }
-    } catch (_) {
-      seen = [];
+    // ✅ Ergänzung #1: Wenn Filter fehlen → sofort harter Fehler (macht Bugs sichtbar)
+    if (!group_type || !mode || !difficulty) {
+      return jsonResponse(res, 400, {
+        status: "error",
+        error: "session_filters_missing",
+        session_id,
+        session_fields: s,
+        missing: {
+          play_with: !group_type,
+          alcohol: !mode,
+          level: !difficulty,
+        },
+      });
     }
 
-    // 2) Filter bauen
+    const filterObj = { group_type, mode, difficulty };
+
+    // 2) Challenges Formel bauen
     const parts = ["{status}='active'"];
-    const filterObj = {};
-    if (group_type) {
-      parts.push(`{group_type}='${group_type}'`);
-      filterObj.group_type = group_type;
-    }
-    if (mode) {
-      parts.push(`{mode}='${mode}'`);
-      filterObj.mode = mode;
-    }
-    if (difficulty) {
-      parts.push(`{difficulty}='${difficulty}'`);
-      filterObj.difficulty = difficulty;
-    }
+    if (group_type) parts.push(`{group_type}='${group_type}'`);
+    if (mode) parts.push(`{mode}='${mode}'`);
+    if (difficulty) parts.push(`{difficulty}='${difficulty}'`);
+
     const formula = `AND(${parts.join(",")})`;
 
     // 3) Challenges holen
     const chResp = await airtableFetch(
-      `/${baseId}/${encodeURIComponent(challengesTable)}?filterByFormula=${encodeURIComponent(formula)}&maxRecords=100`,
-      { method: "GET" }
+      `/v0/${baseId}/${encodeURIComponent(challengesTable)}?filterByFormula=${encodeURIComponent(
+        formula
+      )}`
     );
 
     if (!chResp.ok) {
-      return jsonResponse(res, 500, {
+      return jsonResponse(res, 502, {
         status: "error",
         error: "airtable_challenges_fetch_failed",
-        detail: chResp.data || chResp.text,
-      });
-    }
-
-    const records = chResp.data?.records || [];
-    if (records.length === 0) {
-      return jsonResponse(res, 404, {
-        status: "error",
-        error: "no_matching_challenges_found",
+        airtable_status: chResp.status,
+        airtable_error: chResp.data ?? null,
+        session_id,
         filter: filterObj,
         formula,
       });
     }
 
-    // 4) Ungesehene filtern (via challenge_id)
+    const records = chResp.data?.records ?? [];
+
+    // 4) seen_ids lesen
+    let seen = [];
+    try {
+      const raw = s.seen_ids;
+      if (typeof raw === "string") seen = JSON.parse(raw || "[]");
+      else if (Array.isArray(raw)) seen = raw;
+    } catch {
+      seen = [];
+    }
+
+    // 5) unseen pool bilden
     const unseen = records.filter((r) => {
       const cid = r.fields?.challenge_id;
       return cid != null && !seen.includes(cid);
     });
 
-    // Fallback: wenn alle schon gesehen -> wieder alles zulassen
-    const pool = unseen.length > 0 ? unseen : records;
+    const pool = unseen.length ? unseen : records;
 
-    // 5) Random pick
-    const pick = pool[Math.floor(Math.random() * pool.length)];
-
-    const challenge = {
-      id: pick.id,
-      challenge_id: pick.fields?.challenge_id,
-      challenge_text: pick.fields?.challenge_text,
-      group_type: pick.fields?.group_type,
-      mode: pick.fields?.mode,
-      difficulty: pick.fields?.difficulty,
-      status: pick.fields?.status,
-    };
-
-    // 6) seen_ids updaten (long-text JSON array string)
-    const pickedCid = challenge.challenge_id;
-    let updatedSeen = seen;
-
-    if (pickedCid != null && !seen.includes(pickedCid)) {
-      updatedSeen = [...seen, pickedCid];
-
-      const patchResp = await airtableFetch(
-        `/${baseId}/${encodeURIComponent(sessionsTable)}/${sessionRecord.id}`,
-        {
-          method: "PATCH",
-          body: JSON.stringify({
-            fields: {
-              // ✅ long-text -> JSON array als STRING speichern
-              seen_ids: JSON.stringify(updatedSeen),
-              // ❌ updated_at NICHT setzen (computed/last modified in Airtable)
-            },
-          }),
-        }
-      );
-
-      if (!patchResp.ok) {
-        // Challenge trotzdem liefern – nur warning ausgeben
-        return jsonResponse(res, 200, {
-          status: "ok",
-          session_id,
-          challenge,
-          warning: "seen_ids_update_failed",
-          seen_ids_before: seen,
-          detail: patchResp.data || patchResp.text,
-        });
-      }
+    if (!pool.length) {
+      return jsonResponse(res, 404, {
+        status: "error",
+        error: "no_challenges_found",
+        session_id,
+        filter: filterObj,
+        formula,
+      });
     }
 
+    // 6) random pick
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    const challenge = pick.fields;
+
+    // 7) seen_ids updaten
+    const pickedId = challenge?.challenge_id;
+    const updatedSeen = pickedId != null ? Array.from(new Set([...seen, pickedId])) : seen;
+
+    await airtableFetch(`/v0/${baseId}/${encodeURIComponent(sessionsTable)}/${srec.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        fields: {
+          seen_ids: JSON.stringify(updatedSeen),
+        },
+      }),
+    });
+
+    // ✅ Ergänzung #2: session_fields zusätzlich zurückgeben (macht Debug in Bravo easy)
     return jsonResponse(res, 200, {
       status: "ok",
       session_id,
       challenge,
       seen_ids: updatedSeen,
+      session_fields: s,
       filter: filterObj,
       formula,
     });
